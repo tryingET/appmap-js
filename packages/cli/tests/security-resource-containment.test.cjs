@@ -61,6 +61,7 @@ if (process.argv[2] === '--owned-server') {
     servers.push(cp);
     let errors = '';
     cp.stderr.on('data', (bytes) => { errors += bytes; });
+    cp.diagnostic = () => errors;
     cp.stdout.resume();
     let timer;
     try {
@@ -92,7 +93,7 @@ if (process.argv[2] === '--owned-server') {
     scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'appmap-containment-'));
     root = path.join(scratch, 'root'); sibling = path.join(scratch, 'root-neighbor');
     outside = path.join(scratch, 'outside'); runtime = path.join(scratch, 'runtime');
-    for (const dir of [root, sibling, outside, path.join(root, 'nested'), path.join(runtime, 'built/html')]) fs.mkdirSync(dir, { recursive: true });
+    for (const dir of [root, sibling, outside, path.join(root, 'nested'), path.join(runtime, 'built/html/nested')]) fs.mkdirSync(dir, { recursive: true });
     for (const [file, body] of [
       [path.join(root, 'inside.json'), '{"inside":true}'],
       [path.join(root, 'nested', 'inside.json'), '{"nested":true}'],
@@ -149,4 +150,19 @@ if (process.argv[2] === '--owned-server') {
   test('Given a symlink whose target remains inside the root, when guarded, then preserve contained resource behavior', async () => {
     assert.deepEqual(await request(guarded, resource('inside-link.json')), { status: 200, mime: 'application/json', body: '{"inside":true}' });
   });
+  for (const verify of [true, false]) {
+    for (const [kind, target] of [['resource', resource('nested')], ['static', '/nested']]) {
+      test(`Given a contained ${kind} directory with verify=${verify}, when requested, then return 404 and keep serving real files`, async () => {
+        // A fresh owned server per case keeps an old crash from masking later cases.
+        const base = await start(verify), cp = servers.at(-1);
+        const outcome = await request(base, target).catch((error) => ({ transportError: error.code }));
+        const alive = await request(base, '/appmap.js').catch((error) => ({ transportError: error.code }));
+        console.log(JSON.stringify({ kind, verify, directory: outcome, subsequentFile: alive, childExit: cp.exitCode, diagnostic: cp.diagnostic() }));
+        assert.equal(outcome.status, 404, JSON.stringify(outcome));
+        assert.equal(outcome.body, '');
+        assert.equal(alive.status, 200, JSON.stringify(alive));
+        assert.equal(cp.exitCode, null, cp.diagnostic());
+      });
+    }
+  }
 }

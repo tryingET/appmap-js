@@ -89,6 +89,7 @@ describe('serveAndOpen canonical resource containment', () => {
     sibling = join(scratch, 'root-neighbor');
     outside = join(scratch, 'outside');
     for (const dir of [root, sibling, outside]) mkdirSync(dir);
+    mkdirSync(join(root, 'nested'));
     writeFileSync(join(root, 'inside.json'), '{}');
     writeFileSync(join(sibling, 'outside.json'), '{"ownedSibling":true}');
     writeFileSync(join(outside, 'outside.json'), '{"ownedOutside":true}');
@@ -124,6 +125,15 @@ describe('serveAndOpen canonical resource containment', () => {
   ])('Given %s, when guarded, then return 404', async (_scenario, target) => {
     expect((await request(new URL(`/resource?${encodeURIComponent(target())}`, base))).status).toBe(404);
   });
+
+  it.each([true, false])(
+    'Given a contained directory with verify=%s, when requested, then return 404 and keep serving files',
+    async (verify) => {
+      const server = await serve(verify);
+      expect((await request(new URL('/resource?nested', server))).status).toBe(404);
+      expect((await request(new URL('/resource?inside.json', server))).status).toBe(200);
+    }
+  );
 
   it('Given explicit false mode, when an owned outside path is requested, then preserve access', async () => {
     const unrestricted = await serve(false);

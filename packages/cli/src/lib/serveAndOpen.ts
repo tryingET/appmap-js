@@ -1,4 +1,4 @@
-import { createReadStream, existsSync, realpathSync } from 'fs';
+import { createReadStream, existsSync, realpathSync, statSync } from 'fs';
 import { createServer } from 'http';
 import { AddressInfo } from 'net';
 import open from 'open';
@@ -53,6 +53,14 @@ export default function serveAndOpen(
       // Canonical containment assumes a stable filesystem tree. This is not an
       // atomic open-beneath primitive: concurrent symlink/directory replacement
       // between realpath and stream open must be excluded by the caller.
+
+      // Directories can emit stream open before EISDIR. Refuse them before
+      // committing a 200 response, including explicitly unrestricted mode.
+      try {
+        if (!statSync(path).isFile()) return send404();
+      } catch {
+        return send404();
+      }
 
       // eslint-disable-next-line no-param-reassign
       if (!contentType) contentType = mimeTypeOfName(fileName);
