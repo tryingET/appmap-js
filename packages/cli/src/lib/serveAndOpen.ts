@@ -1,8 +1,8 @@
-import { createReadStream, existsSync } from 'fs';
+import { createReadStream, existsSync, realpathSync } from 'fs';
 import { createServer } from 'http';
 import { AddressInfo } from 'net';
 import open from 'open';
-import { extname, isAbsolute, join } from 'path';
+import { extname, isAbsolute, join, relative, sep } from 'path';
 import { parse } from 'url';
 import { exists, verbose } from '../utils';
 import UI from '../cmds/userInteraction';
@@ -38,8 +38,21 @@ export default function serveAndOpen(
     };
 
     const serveStaticFile = (dir: string, fileName: string, contentType?: string) => {
-      const path = isAbsolute(fileName) ? fileName : join(dir, fileName);
-      if (verifyInSubdir && !path.startsWith(dir)) return send404();
+      let path = isAbsolute(fileName) ? fileName : join(dir, fileName);
+      if (verifyInSubdir) {
+        try {
+          const root = realpathSync(dir);
+          path = realpathSync(path);
+          const fromRoot = relative(root, path);
+          if (!fromRoot || fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot))
+            return send404();
+        } catch {
+          return send404();
+        }
+      }
+      // Canonical containment assumes a stable filesystem tree. This is not an
+      // atomic open-beneath primitive: concurrent symlink/directory replacement
+      // between realpath and stream open must be excluded by the caller.
 
       // eslint-disable-next-line no-param-reassign
       if (!contentType) contentType = mimeTypeOfName(fileName);
