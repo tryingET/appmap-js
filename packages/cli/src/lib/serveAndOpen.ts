@@ -66,8 +66,18 @@ export default function serveAndOpen(
       if (!contentType) contentType = mimeTypeOfName(fileName);
 
       const fileStream = createReadStream(path);
-      fileStream.pipe(res);
+      const closeFile = () => {
+        fileStream.destroy();
+      };
+      res.once('close', closeFile);
+      req.once('aborted', closeFile);
+      fileStream.once('close', () => {
+        res.off('close', closeFile);
+        req.off('aborted', closeFile);
+      });
       fileStream.on('open', function () {
+        // A client can disconnect while the asynchronous file open is pending.
+        if (res.destroyed || req.aborted || fileStream.destroyed) return closeFile();
         if (verbose()) {
           console.log(`${path}: 200`);
         }
@@ -75,10 +85,15 @@ export default function serveAndOpen(
       });
       fileStream.on('error', function (e) {
         if (verbose()) {
-          console.log(`${path}: 404 (${e})`);
+          console.log(`${path}: ${res.headersSent ? 'stream error' : '404'} (${e})`);
         }
-        send404();
+        if (res.destroyed) return;
+        // Once 200/body bytes are committed, a second status is impossible.
+        // Terminate the incomplete response without killing the server.
+        if (res.headersSent) res.destroy(e);
+        else send404();
       });
+      fileStream.pipe(res);
     };
 
     try {

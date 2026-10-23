@@ -1,7 +1,8 @@
 // Supplemental real-source/real-HTTP regression, not a replacement for yarn verify.
 // APPMAP_TEST_SUPPORT=/absolute/existing/node_modules node --test <this file>
 // No installation or build. Only unrelated progress/log/browser-open collaborators
-// are inert; filesystem, URL handling, HTTP server and streams are the real Node APIs.
+// are inert; URL handling/HTTP server are real Node APIs. Selected owned fixtures
+// additionally inject read/open faults or delay reads on real fs.ReadStreams.
 const assert = require('node:assert/strict');
 const { fork } = require('node:child_process');
 const { once } = require('node:events');
@@ -25,7 +26,62 @@ if (process.argv[2] === '--owned-server') {
   const filename = path.join(process.env.APPMAP_TEST_RUNTIME, 'src/lib/serveAndOpen.cjs');
   const loaded = new Module(filename, module);
   loaded.filename = filename;
+  const observedStreams = [];
+  let releaseOpen;
+  const notify = (message) => { if (process.connected) process.send(message); };
+  function faultStream(file, options) {
+    const name = path.basename(file);
+    const mode = process.env.APPMAP_TEST_STREAM_FAULT;
+    if (!mode || name !== 'stream-fixture.bin') return fs.createReadStream(file, options);
+    const injected = () => Object.assign(new Error(`owned fixture ${mode}`), { code: 'EIO' });
+    let reads = 0;
+    const io = { ...fs,
+      open(file, flags, permissions, callback) {
+        if (mode === 'before-open') return setImmediate(() => callback(injected()));
+        if (mode === 'disconnect-before-open') {
+          releaseOpen = () => fs.open(file, flags, permissions, callback);
+          notify({ kind: 'stream', event: 'open-held' });
+          return;
+        }
+        return fs.open(file, flags, permissions, callback);
+      },
+      read(fd, buffer, offset, length, position, callback) {
+        reads++;
+        if (mode === 'after-open' || (mode === 'after-data' && reads > 1)) return setImmediate(() => callback(injected()));
+        return fs.read(fd, buffer, offset, length, position, callback);
+      },
+    };
+    const stream = fs.createReadStream(file, { ...options, highWaterMark: 4096, fs: io });
+    observedStreams.push(stream);
+    notify({ kind: 'stream', event: 'created' });
+    stream.on('open', () => notify({ kind: 'stream', event: 'open', fd: stream.fd }));
+    stream.once('data', (bytes) => {
+      // Stop future reads, without leaving a pending filesystem callback. This
+      // makes disconnect cleanup observable rather than racing normal EOF.
+      if (mode === 'disconnect-after-data') stream._read = () => {};
+      notify({ kind: 'stream', event: 'data', bytes: bytes.length });
+    });
+    stream.on('error', (error) => notify({ kind: 'stream', event: 'error', code: error.code }));
+    stream.on('close', () => notify({ kind: 'stream', event: 'close', closed: stream.closed, destroyed: stream.destroyed, fd: stream.fd }));
+    return stream;
+  }
+  process.on('message', (message) => {
+    if (message?.query === 'streams') notify({ kind: 'snapshot', token: message.token,
+      streams: observedStreams.map((stream) => ({ closed: stream.closed, destroyed: stream.destroyed, fd: stream.fd, paused: stream.isPaused() })) });
+  });
   loaded.require = (name) => {
+    if (name === 'fs') return { ...fs, createReadStream: faultStream };
+    if (name === 'http') return { ...http, createServer(listener) {
+      return http.createServer((req, res) => {
+        listener(req, res);
+        res.once('close', () => {
+          if (releaseOpen) {
+            notify({ kind: 'stream', event: 'response-close-before-open' });
+            const release = releaseOpen; releaseOpen = undefined; release();
+          }
+        });
+      });
+    } };
     if (name === '../utils') return { verbose: () => false };
     if (name === '../cmds/userInteraction') return { progress() {}, warn() {} };
     if (name === 'open') return () => { throw new Error('Browser opening is outside this test'); };
@@ -52,16 +108,18 @@ if (process.argv[2] === '--owned-server') {
       })]);
     } finally { clearTimeout(kill); clearTimeout(deadline); }
   }
-  async function start(verify) {
+  async function start(verify, streamFault = '') {
     const cp = fork(__filename, ['--owned-server'], {
       cwd: root, execArgv: [], stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
       env: { PATH: process.env.PATH, APPMAP_TEST_SUPPORT: process.env.APPMAP_TEST_SUPPORT,
-        APPMAP_TEST_RUNTIME: runtime, APPMAP_TEST_VERIFY: String(verify), HOME: scratch, TMPDIR: scratch },
+        APPMAP_TEST_RUNTIME: runtime, APPMAP_TEST_VERIFY: String(verify), APPMAP_TEST_STREAM_FAULT: streamFault, HOME: scratch, TMPDIR: scratch },
     });
     servers.push(cp);
     let errors = '';
     cp.stderr.on('data', (bytes) => { errors += bytes; });
     cp.diagnostic = () => errors;
+    cp.streamEvents = [];
+    cp.on('message', (message) => { if (message?.kind === 'stream') cp.streamEvents.push(message); });
     cp.stdout.resume();
     let timer;
     try {
@@ -88,6 +146,41 @@ if (process.argv[2] === '--owned-server') {
     });
   }
   const resource = (name) => `/resource?${encodeURIComponent(name)}`;
+  function streamState(cp) {
+    return new Promise((resolve, reject) => {
+      const token = `${Date.now()}-${Math.random()}`;
+      const timer = setTimeout(() => { cp.off('message', receive); reject(new Error('Stream state timeout')); }, 1000);
+      function receive(message) {
+        if (message?.kind !== 'snapshot' || message.token !== token) return;
+        clearTimeout(timer); cp.off('message', receive); resolve(message.streams);
+      }
+      cp.on('message', receive); cp.send({ query: 'streams', token });
+    });
+  }
+  async function waitStreamClosed(cp) {
+    let state;
+    for (let attempt = 0; attempt < 50; attempt++) {
+      state = await streamState(cp);
+      if (state.length === 1 && state[0].closed && state[0].destroyed && state[0].fd === null) return state;
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return state;
+  }
+  function streamRequest(base, disconnect = false) {
+    return new Promise((resolve) => {
+      let status, bytes = 0, settled = false, timedOut = false;
+      const finish = (extra) => { if (!settled) { settled = true; resolve({ status, bytes, ...extra, timedOut }); } };
+      const req = http.get(new URL(resource('stream-fixture.bin'), base), { agent: false }, (res) => {
+        status = res.statusCode;
+        res.on('data', (chunk) => { bytes += chunk.length; if (disconnect) res.destroy(); });
+        res.on('end', () => finish({ complete: res.complete }));
+        res.on('aborted', () => finish({ complete: false, transportError: 'aborted' }));
+        res.on('error', (error) => finish({ complete: false, transportError: error.code }));
+      });
+      req.setTimeout(3000, () => { timedOut = true; req.destroy(new Error('Stream response timeout')); });
+      req.on('error', (error) => finish({ complete: false, transportError: error.code || error.message }));
+    });
+  }
   let guarded, unrestricted;
   before(async () => {
     scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'appmap-containment-'));
@@ -104,6 +197,7 @@ if (process.argv[2] === '--owned-server') {
       [path.join(runtime, 'built/html', 'appmap.css'), '/* owned CSS */'],
       [path.join(runtime, 'built/html', 'appmap.js.map'), '{}'],
     ]) fs.writeFileSync(file, body);
+    fs.writeFileSync(path.join(root, 'stream-fixture.bin'), Buffer.alloc(128 * 1024, 'x'));
     fs.symlinkSync(path.join(outside, 'outside.json'), path.join(root, 'escape.json'));
     fs.symlinkSync(outside, path.join(root, 'escape-dir'), 'dir');
     fs.symlinkSync(path.join(root, 'inside.json'), path.join(root, 'inside-link.json'));
@@ -149,6 +243,54 @@ if (process.argv[2] === '--owned-server') {
   });
   test('Given a symlink whose target remains inside the root, when guarded, then preserve contained resource behavior', async () => {
     assert.deepEqual(await request(guarded, resource('inside-link.json')), { status: 200, mime: 'application/json', body: '{"inside":true}' });
+  });
+  for (const mode of ['before-open', 'after-open', 'after-data']) {
+    test(`Given injected EIO ${mode}, when real HTTP streams a contained fixture, then report failure without killing the server`, async () => {
+      const base = await start(true, mode), cp = servers.at(-1);
+      const result = await streamRequest(base);
+      const alive = await request(base, '/appmap.js').catch((error) => ({ transportError: error.code }));
+      console.log(JSON.stringify({ mode, result, alive, events: cp.streamEvents, diagnostic: cp.diagnostic() }));
+      assert.equal(alive.status, 200, cp.diagnostic());
+      if (mode === 'before-open') { assert.equal(result.status, 404); assert.equal(result.complete, true); }
+      else {
+        assert.equal(result.complete, false);
+        assert.equal(result.timedOut, false, 'Client timeout must not masquerade as server termination');
+        assert.ok(['ECONNRESET', 'aborted'].includes(result.transportError), JSON.stringify(result));
+      }
+      if (mode === 'after-data') assert.ok(result.bytes > 0, 'Fault must follow actual body bytes');
+      assert.ok(cp.streamEvents.some((event) => event.event === 'error' && event.code === 'EIO'));
+      const state = await waitStreamClosed(cp);
+      assert.deepEqual(state.map(({ closed, destroyed, fd }) => ({ closed, destroyed, fd })), [{ closed: true, destroyed: true, fd: null }]);
+    });
+  }
+  test('Given a client disconnect after data, when the real response closes, then destroy and close the owned paused file stream', async () => {
+    const base = await start(true, 'disconnect-after-data'), cp = servers.at(-1);
+    const result = await streamRequest(base, true);
+    assert.ok(result.bytes > 0); assert.equal(result.complete, false);
+    const state = await waitStreamClosed(cp);
+    console.log(JSON.stringify({ mode: 'disconnect-after-data', result, state, events: cp.streamEvents }));
+    assert.deepEqual(state.map(({ closed, destroyed, fd }) => ({ closed, destroyed, fd })), [{ closed: true, destroyed: true, fd: null }]);
+    assert.equal((await request(base, '/appmap.js')).status, 200);
+  });
+  test('Given a client disconnect before delayed open, when opening settles, then the owned file descriptor closes', async () => {
+    const base = await start(true, 'disconnect-before-open'), cp = servers.at(-1);
+    const req = http.get(new URL(resource('stream-fixture.bin'), base), { agent: false });
+    req.on('error', () => {});
+    try {
+      for (let attempt = 0; attempt < 100 && !cp.streamEvents.some((event) => event.event === 'open-held'); attempt++) {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      assert.ok(cp.streamEvents.some((event) => event.event === 'open-held'));
+      assert.equal(cp.streamEvents.some((event) => event.event === 'open'), false);
+      req.destroy();
+      const state = await waitStreamClosed(cp);
+      console.log(JSON.stringify({ mode: 'disconnect-before-open', state, events: cp.streamEvents }));
+      const closeIndex = cp.streamEvents.findIndex((event) => event.event === 'response-close-before-open');
+      const openIndex = cp.streamEvents.findIndex((event) => event.event === 'open');
+      assert.ok(closeIndex >= 0 && openIndex > closeIndex, 'Server disconnect must precede released open');
+      assert.deepEqual(state.map(({ closed, destroyed, fd }) => ({ closed, destroyed, fd })), [{ closed: true, destroyed: true, fd: null }]);
+      assert.equal((await request(base, '/appmap.js')).status, 200);
+    } finally { req.destroy(); }
   });
   for (const verify of [true, false]) {
     for (const [kind, target] of [['resource', resource('nested')], ['static', '/nested']]) {
