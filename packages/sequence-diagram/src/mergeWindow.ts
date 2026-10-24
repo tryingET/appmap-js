@@ -1,7 +1,15 @@
 import sha256 from 'crypto-js/sha256.js';
 import { LRUCache } from 'lru-cache';
 import type { Action, Loop } from './types';
-import { actionActors, isClientRPC, isFunction, isLoop, isServerRPC, NodeType } from './types';
+import {
+  actionActors,
+  isClientRPC,
+  isFunction,
+  isLoop,
+  isQuery,
+  isServerRPC,
+  NodeType,
+} from './types';
 
 const sha256Cache = new LRUCache<string, string>({ max: 3000 });
 
@@ -14,7 +22,7 @@ function digest(sha256Input: string): string {
   return result;
 }
 
-// Keep public loop digests compatible. Compression eligibility is stricter than
+// Keep the loop-discovery digest independent of compression eligibility. Compression eligibility is stricter than
 // the legacy subtree digest, which omits return metadata and nested loop counts.
 function buildDigest(actions: Action[]): string {
   return digest(actions.map((action) => action.subtreeDigest).join('\n'));
@@ -44,6 +52,10 @@ function compressionProperties(action: Action): unknown[] {
     actionActors(action).map((actor) => actor?.id),
     isLoop(action) ? action.count : undefined,
     functionProperties,
+    // Query digests can be normalized, or even the constant "truncatedQuery".
+    // The representative must not erase the actual statement or classification.
+    isQuery(action) ? action.query : undefined,
+    action.labels,
     isServerRPC(action) || isClientRPC(action) ? [action.route, action.status] : undefined,
     // Inspect current children, not just a digest built before inner compression.
     action.children.map(compressionProperties),

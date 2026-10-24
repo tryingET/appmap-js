@@ -1,12 +1,25 @@
 import { buildAppMap } from '@appland/models';
 import { LIST_USERS_APPMAP, LIST_USERS_PREFETCH_APPMAP, loadDiagram } from '../util';
 import type { Action, Diagram } from '../../src/types';
-import { isFunction, isLoop, NodeType } from '../../src/types';
+import {
+  actionActors,
+  isFunction,
+  isLoop,
+  isQuery,
+  isServerRPC,
+  isClientRPC,
+  DiffMode,
+  NodeType,
+} from '../../src/types';
 import { format as json } from '../../src/formatter/json';
+import diff, { MoveType } from '../../src/diff';
+import buildDiffDiagram from '../../src/buildDiffDiagram';
+import sha256 from 'crypto-js/sha256.js';
 
 type Call = {
   name: string;
   result?: string;
+  sql?: string;
   exception?: boolean;
   properties?: { name: string; class: string }[];
   elapsed?: number;
@@ -27,6 +40,7 @@ function build(calls: Call[], loops = true): Diagram {
       method_id: call.name,
       path: 'worker.rb',
       lineno: 1,
+      sql_query: call.sql ? { database_type: 'postgresql', sql: call.sql } : undefined,
     });
     call.children?.forEach(append);
     events.push({
@@ -72,15 +86,23 @@ function metadataByEvent(diagram: Diagram): unknown[] {
     action.eventIds.forEach((id) =>
       entries.push([
         id,
-        isFunction(action)
-          ? {
-              name: action.name,
-              caller: action.caller?.id,
-              callee: action.callee.id,
-              stableProperties: action.stableProperties,
-              returnValue: action.returnValue,
-            }
-          : { nodeType: action.nodeType },
+        {
+          nodeType: action.nodeType,
+          actors: actionActors(action).map((actor) => actor?.id),
+          labels: action.labels,
+          ...(isFunction(action)
+            ? {
+                name: action.name,
+                static: action.static,
+                stableProperties: action.stableProperties,
+                returnValue: action.returnValue,
+              }
+            : {}),
+          ...(isQuery(action) ? { query: action.query } : {}),
+          ...(isServerRPC(action) || isClientRPC(action)
+            ? { route: action.route, status: action.status }
+            : {}),
+        },
       ])
     );
     action.children.forEach(visit);
@@ -217,4 +239,115 @@ describe('GIVEN real AppMap events and enabled native loop compression', () => {
     ]);
     expect(metadataByEvent(compressed)).toEqual(metadataByEvent(build(calls, false)));
   });
+});
+
+function flatten(diagram: Diagram): Action[] {
+  const result: Action[] = [];
+  const visit = (action: Action) => {
+    result.push(action);
+    action.children.forEach(visit);
+  };
+  diagram.rootActions.forEach(visit);
+  return result;
+}
+
+function compared(reverse: boolean) {
+  const heterogeneous = build([repeated(), repeated('Integer'), repeated()]);
+  const homogeneous = build([repeated(), repeated(), repeated()]);
+  expect(heterogeneous.rootActions[0].children).toHaveLength(3);
+  expect(homogeneous.rootActions[0].children).toHaveLength(1);
+  return reverse ? diff(homogeneous, heterogeneous) : diff(heterogeneous, homogeneous);
+}
+
+describe('GIVEN native diagrams whose return metadata changes compression shape', () => {
+  it.each([false, true])(
+    'WHEN compared with reverse=%s THEN every node is covered exactly once with valid same-kind paired targets',
+    (reverse) => {
+      const result = compared(reverse);
+      const left = result.moves
+        .map((move) => move.lNode)
+        .filter((index) => index >= 0)
+        .sort((a, b) => a - b);
+      const right = result.moves
+        .map((move) => move.rNode)
+        .filter((index) => index >= 0)
+        .sort((a, b) => a - b);
+      expect(left).toEqual(result.baseActions.map((_, index) => index));
+      expect(right).toEqual(result.headActions.map((_, index) => index));
+      for (const move of result.moves) {
+        if ([MoveType.AdvanceBoth, MoveType.Change, MoveType.Move].includes(move.moveType)) {
+          expect(move.lNode).toBeGreaterThanOrEqual(0);
+          expect(move.rNode).toBeGreaterThanOrEqual(0);
+          expect(result.baseActions[move.lNode].nodeType).toBe(
+            result.headActions[move.rNode].nodeType
+          );
+        }
+      }
+    }
+  );
+
+  it.each([false, true])(
+    'WHEN overlay is built with reverse=%s THEN no invalid target or dropped head node exists',
+    (reverse) => {
+      const result = compared(reverse);
+      let overlay: Diagram | undefined;
+      expect(() => {
+        overlay = buildDiffDiagram(result);
+      }).not.toThrow();
+      expect(flatten(overlay!)).toHaveLength(result.moves.length);
+      const retainedHead = flatten(overlay!).filter(
+        (action) => action.diffMode !== DiffMode.Delete
+      );
+      const head = result.headActions;
+      expect(
+        retainedHead.map((action) => ({ kind: action.nodeType, ids: action.eventIds }))
+      ).toEqual(head.map((action) => ({ kind: action.nodeType, ids: action.eventIds })));
+    }
+  );
+
+  it('WHEN subtree digests are read after compression THEN they describe current children and distinguish nested loop counts', () => {
+    const two = build([repeated(), repeated()]);
+    const three = build([repeated(), repeated(), repeated()]);
+    for (const diagram of [two, three]) {
+      const root = diagram.rootActions[0];
+      expect(root.subtreeDigest).toBe(
+        sha256(
+          [root.digest, ...root.children.map((child) => child.subtreeDigest)].join('\n')
+        ).toString()
+      );
+    }
+    expect(two.rootActions[0].subtreeDigest).not.toBe(three.rootActions[0].subtreeDigest);
+    expect(two.rootActions[0].children[0].subtreeDigest).not.toBe(
+      three.rootActions[0].children[0].subtreeDigest
+    );
+  });
+});
+
+describe('GIVEN truncated native queries sharing the legacy truncatedQuery digest', () => {
+  it.each([
+    { name: 'different statements', sql: ['SELECT ...', 'DELETE ...'], count: 2 },
+    { name: 'identical statements', sql: ['SELECT ...', 'SELECT ...'], count: 1 },
+    {
+      name: 'repeated window with a different trailing query',
+      sql: ['SELECT ...', 'SELECT ...', 'DELETE ...'],
+      count: 2,
+    },
+  ])(
+    'WHEN $name are compressed THEN exact per-event SQL is preserved without disabling equal-query loops',
+    ({ sql, count }) => {
+      const calls = sql.map((text) => ({ name: 'query', sql: text }));
+      const compressed = build(calls);
+      expect(compressed.rootActions[0].children).toHaveLength(count);
+      expect(metadataByEvent(compressed)).toEqual(metadataByEvent(build(calls, false)));
+      const queries = flatten(compressed).filter(isQuery);
+      expect(queries.every((action) => action.digest === 'truncatedQuery')).toBe(true);
+      if (sql[0] === sql[1]) {
+        expect(compressed.rootActions[0].children[0]).toMatchObject({
+          nodeType: NodeType.Loop,
+          count: 2,
+        });
+        expect(queries[0].eventIds).toEqual([2, 4]);
+      }
+    }
+  );
 });

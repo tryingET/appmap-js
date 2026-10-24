@@ -99,6 +99,14 @@ describe('GIVEN native repeated action windows', () => {
 });
 
 describe('GIVEN equal legacy subtree digests but different action metadata', () => {
+  it('WHEN labels differ THEN classification metadata is not discarded even though labels are not public digest identity', () => {
+    const first = call('a', 1);
+    const second = call('a', 2);
+    first.labels = ['read'];
+    second.labels = ['write'];
+    expect(merge([first, second], 1)).toBeUndefined();
+  });
+
   it.each([
     {
       distinction: 'return type',
