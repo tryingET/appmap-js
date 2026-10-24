@@ -1,12 +1,11 @@
 import sha256 from 'crypto-js/sha256.js';
 import { LRUCache } from 'lru-cache';
 import type { Action, Loop } from './types';
-import { NodeType } from './types';
+import { actionActors, isClientRPC, isFunction, isLoop, isServerRPC, NodeType } from './types';
 
 const sha256Cache = new LRUCache<string, string>({ max: 3000 });
 
-function buildDigest(actions: Action[]): string {
-  const sha256Input = actions.map((action) => action.subtreeDigest).join('\n');
+function digest(sha256Input: string): string {
   let result = sha256Cache.get(sha256Input);
   if (!result) {
     result = sha256(sha256Input).toString();
@@ -15,11 +14,51 @@ function buildDigest(actions: Action[]): string {
   return result;
 }
 
+// Keep public loop digests compatible. Compression eligibility is stricter than
+// the legacy subtree digest, which omits return metadata and nested loop counts.
+function buildDigest(actions: Action[]): string {
+  return digest(actions.map((action) => action.subtreeDigest).join('\n'));
+}
+
+function compressionProperties(action: Action): unknown[] {
+  const functionProperties = isFunction(action)
+    ? [
+        action.name,
+        action.static,
+        Object.keys(action.stableProperties)
+          .sort()
+          .map((key) => [key, action.stableProperties[key]]),
+        action.returnValue && [
+          action.returnValue.raisesException,
+          action.returnValue.returnValueType && [
+            action.returnValue.returnValueType.name,
+            action.returnValue.returnValueType.properties,
+          ],
+        ],
+      ]
+    : undefined;
+  return [
+    action.nodeType,
+    action.digest,
+    action.subtreeDigest,
+    actionActors(action).map((actor) => actor?.id),
+    isLoop(action) ? action.count : undefined,
+    functionProperties,
+    isServerRPC(action) || isClientRPC(action) ? [action.route, action.status] : undefined,
+    // Inspect current children, not just a digest built before inner compression.
+    action.children.map(compressionProperties),
+  ];
+}
+
+function buildWindowDigest(actions: Action[]): string {
+  return digest(JSON.stringify(actions.map(compressionProperties)));
+}
+
 function countDigests(actions: Action[], windowSize: number): Map<string, number> {
   const digestCount = new Map<string, number>();
   for (let index = 0; index + windowSize <= actions.length; index++) {
     const range = actions.slice(index, index + windowSize);
-    const digest = buildDigest(range);
+    const digest = buildWindowDigest(range);
     const count = digestCount.get(digest);
     if (count !== undefined) digestCount.set(digest, count + 1);
     else digestCount.set(digest, 1);
@@ -91,9 +130,9 @@ export function merge(actions: Action[], windowSize: number): Action[] | undefin
     const referenceDigest = digestsSorted[digestIndex];
     const result: (Merge | Action)[] = [];
     let merge: Merge | undefined = undefined;
-    for (let actionIndex = 0; actionIndex + windowSize <= actions.length; ) {
+    for (let actionIndex = 0; actionIndex < actions.length; ) {
       const window = actions.slice(actionIndex, actionIndex + windowSize);
-      const windowDigest = buildDigest(window);
+      const windowDigest = window.length === windowSize ? buildWindowDigest(window) : undefined;
       if (windowDigest === referenceDigest) {
         if (merge) {
           merge.push(window);
