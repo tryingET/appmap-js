@@ -5,6 +5,23 @@ import { resolve } from 'node:path';
 const packageRoot = resolve(__dirname, '../..');
 
 describe('compiled-assets-only CLI packaging', () => {
+  it('keeps publication safety and bundled notice contracts executable in CI', () => {
+    execFileSync(
+      process.execPath,
+      [
+        '--test',
+        resolve(__dirname, '../publication-safety.test.cjs'),
+        resolve(__dirname, '../bundled-notices.test.cjs'),
+      ],
+      {
+        cwd: packageRoot,
+        encoding: 'utf8',
+        timeout: 90000,
+        maxBuffer: 4 * 1024 * 1024,
+      }
+    );
+  }, 100000);
+
   it('Given compiled viewer assets, when declaring the package, then do not promise bundled package folders', () => {
     const manifest = JSON.parse(readFileSync(resolve(packageRoot, 'package.json'), 'utf8')) as {
       bundledDependencies?: string[];

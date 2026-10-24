@@ -56,9 +56,11 @@ before(() => {
   console.log(`Local pack scratch: ${scratch}`);
   const stage = path.join(scratch, 'stage'), out = path.join(scratch, 'out');
   for (const dir of [stage, out, path.join(scratch, 'home')]) fs.mkdirSync(dir);
-  originalFiles = ['built', 'resources'].flatMap((dir) => inventory(assets, `${dir}/`));
+  originalFiles = ['built', 'resources', 'third-party'].flatMap((dir) => inventory(assets, `${dir}/`));
+  originalFiles.push({ path: 'THIRD_PARTY_NOTICES.txt', sha256: sha(fs.readFileSync(path.join(assets, 'THIRD_PARTY_NOTICES.txt'))) });
   assert.ok(originalFiles.length > 0, 'Existing built/resource bytes required; do not silently substitute fixtures');
-  for (const dir of ['built', 'resources']) fs.cpSync(path.join(assets, dir), path.join(stage, dir), { recursive: true });
+  for (const dir of ['built', 'resources', 'third-party']) fs.cpSync(path.join(assets, dir), path.join(stage, dir), { recursive: true });
+  fs.copyFileSync(path.join(assets, 'THIRD_PARTY_NOTICES.txt'), path.join(stage, 'THIRD_PARTY_NOTICES.txt'));
   for (const name of ['LICENSE', 'LICENSE.txt', 'CHANGELOG.md', 'README.md']) {
     if (fs.existsSync(path.join(assets, name))) fs.copyFileSync(path.join(assets, name), path.join(stage, name));
   }
@@ -126,6 +128,23 @@ test('Given existing built viewer and resource bytes, when packed, then all file
       assert.equal(sha(fs.readFileSync(path.join(scratch, 'unpacked/package', license))), sha(fs.readFileSync(path.join(assets, license))));
     }
   }
+});
+test('Given the actual pack, then required notices and sanitized provider docs survive', () => {
+  const packed = path.join(scratch, 'unpacked/package');
+  for (const file of ['THIRD_PARTY_NOTICES.txt', 'third-party/inventory.json', 'third-party/policy.json']) {
+    assert.ok(members.includes(`package/${file}`), `Missing ${file}`);
+  }
+  const notices = JSON.parse(fs.readFileSync(path.join(packed, 'third-party/inventory.json')));
+  assert.ok(notices.packages.length > 0);
+  for (const text of notices.texts) {
+    const bytes = fs.readFileSync(path.join(packed, 'third-party', text.path));
+    assert.equal(sha(bytes), text.sha256);
+    assert.equal(bytes.length, text.bytes);
+  }
+  const doc = fs.readFileSync(path.join(packed, 'built/docs/using-navie-ai/choose-llm-provider.md'), 'utf8');
+  assert.ok(doc.includes('<your-openai-api-key>'));
+  assert.ok(doc.includes('<your-anthropic-api-key>'));
+  assert.equal(/\bsk-[A-Za-z0-9_-]{24,}/.test(doc), false, 'Credential-shaped packed documentation');
 });
 test('Given runtime dependencies and release metadata, when packed without scripts, then source declarations are preserved', () => {
   for (const field of ['name', 'version', 'dependencies', 'optionalDependencies', 'engines', 'files', 'scripts', 'pkg', 'publishConfig']) {

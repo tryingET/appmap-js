@@ -1,0 +1,6 @@
+# Preserve exact third-party legal bytes and their content-addressed evidence.
+/THIRD_PARTY_NOTICES.txt -text
+/third-party/policy.json -text
+/third-party/inventory.json -text
+/third-party/SOURCE_AVAILABILITY.md -text
+/third-party/texts/** -text

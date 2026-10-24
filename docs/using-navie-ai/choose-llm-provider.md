@@ -70,7 +70,7 @@ Select "GitHub Copilot":
 
 Only `OPENAI_API_KEY` needs to be set, other settings can stay default:
 
-| `OPENAI_API_KEY`| `sk-9spQsnE3X7myFHnjgNKKgIcGAdaIG78I3HZB4DFDWQGM` |
+| `OPENAI_API_KEY`| `<your-openai-api-key>` |
 
 When using your own OpenAI API key, you can also modify the OpenAI model for Navie to use. For example if you wanted to use `gpt-3.5` or use an preview model like `gpt-4-vision-preview`.
 
@@ -157,7 +157,7 @@ In the next box, give your key an easy to recognize name.
 
 In your VS Code or JetBrains editor, configure the following environment variables:
 
-| `ANTHROPIC_API_KEY`| `sk-ant-api03-8SgtgQrGB0vTSsB_DeeIZHvDrfmrg` |
+| `ANTHROPIC_API_KEY`| `<your-anthropic-api-key>` |
 | `APPMAP_NAVIE_MODEL`| `claude-3-5-sonnet-20240620` |
 
 When setting the `APPMAP_NAVIE_MODEL` refer to the [Anthropic documentation](https://docs.anthropic.com/en/docs/intro-to-claude#model-options) for the latest available models to chose from.
