@@ -17,6 +17,7 @@ on:
 
 jobs:
   setup:
+    if: github.repository == 'getappmap/appmap-js'
     runs-on: ubuntu-slim
     outputs:
       release_tag: ${{ steps.determine.outputs.release_tag }}

@@ -201,7 +201,7 @@ jobs:
         run: yarn test:scripts
 
   release:
-    if: github.ref == 'refs/heads/main'
+    if: github.ref == 'refs/heads/main' && github.repository == 'getappmap/appmap-js'
     needs:
       - test_cli
       - test_components
