@@ -12,6 +12,7 @@
     "build": "tsup",
     "lint": "eslint 'src/**/*.[jt]s' 'tests/**/*.[jt]s'",
     "lint:fix": "eslint 'src/**/*.[jt]s' 'tests/**/*.[jt]s' --fix",
+    "typecheck": "tsc --noEmit",
     "pre-commit": "lint-staged",
     "test": "jest",
     "watch": "tsup --watch"
@@ -23,9 +24,10 @@
   },
   "files": [
     "dist",
-    "types"
+    "types",
+    "schema"
   ],
-  "types": "types/index.d.ts",
+  "types": "types/public.d.ts",
   "author": "",
   "license": "Commons Clause + MIT",
   "devDependencies": {
